@@ -1,4 +1,4 @@
-import os, re, time, requests, base64
+import os, re, time, requests
 from flask import Flask, request, jsonify
 from urllib.parse import urlparse
 from html import unescape
@@ -6,16 +6,16 @@ import tldextract, idna
 
 app = Flask(__name__)
 
-# === Reputation services (env-configurable) ===
+# === Reputation service (env var) ===
 GSB_API_KEY = os.getenv("GSB_API_KEY", "").strip()
 GSB_URL = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 
 # === Heuristic config ===
 SUSPICIOUS_TLDS = {"zip","xyz","ru","tk","top","work","click","fit","cf","gq","ml"}
-SAFE_TLDS = {"com","org","net","co","uk","edu","gov"}
-SHORTENERS = {"bit.ly","t.co","tinyurl.com","goo.gl","ow.ly","is.gd"}
+SAFE_TLDS       = {"com","org","net","co","uk","edu","gov"}
+SHORTENERS      = {"bit.ly","t.co","tinyurl.com","goo.gl","ow.ly","is.gd"}
 
-# Tolerant URL regex (avoids <> and quotes; captures domains-with-paths too)
+# Tolerant URL regex (avoids < > " ), captures domains-with-paths too
 URL_RE = re.compile(
     r'(https?://[^\s<>"\)]+|[a-z0-9.-]+\.[a-z]{2,}(/[^\s<>"\)]*)?)',
     re.I
@@ -49,7 +49,7 @@ def extract_first_url(text: str):
         return None
     t = unescape(text).replace("\u200b","").replace("\u2060","").strip()
 
-    # 1) HTML anchor <a href="...">
+    # 1) HTML <a href="...">
     m = re.search(r'href=["\']([^"\']+)["\']', t, flags=re.I)
     if m:
         return m.group(1).strip()
@@ -64,7 +64,7 @@ def extract_first_url(text: str):
     if m:
         return m.group(1).strip()
 
-    # 4) Fallback: plain text / domain
+    # 4) Fallback plain text/domain
     m = URL_RE.search(t)
     return m.group(0).strip() if m else None
 
@@ -104,11 +104,11 @@ def heuristic_score(url: str):
     return score, signals, domain
 
 # ---------------------------
-# Reputation lookups
+# Reputation lookup
 # ---------------------------
 
 def gsb_lookup(url: str):
-    """Google Safe Browsing v4 lookup. Returns 'malicious', 'clean', 'error', or None if not configured."""
+    """Google Safe Browsing v4. Returns 'malicious', 'clean', 'error', or None if not configured."""
     if not GSB_API_KEY:
         return None
     payload = {
@@ -134,7 +134,6 @@ def gsb_lookup(url: str):
         return "error"
 
 def decide(score, rep):
-    # Reputation overrides heuristics if clearly malicious
     if rep == "malicious":
         return "danger", "Reported as malicious by a reputation service."
     if score >= 3:
@@ -142,7 +141,7 @@ def decide(score, rep):
     return "safe", "No obvious risks found in quick checks."
 
 # ---------------------------
-# API routes
+# Routes
 # ---------------------------
 
 @app.post("/check_url")
@@ -164,8 +163,7 @@ def check_url():
     url = normalize_url(url_raw)
     score, signals, domain = heuristic_score(url)
 
-    # Reputation (optional if key present)
-    rep = gsb_lookup(url)  # returns 'malicious', 'clean', 'error', or None
+    rep = gsb_lookup(url)  # may be None if no key
     risk, rationale = decide(score, rep)
 
     tips = {
@@ -183,10 +181,26 @@ def check_url():
         ]
     }[risk]
 
+    # Decorated fields for Tiledesk (no conditionals in template)
+    banner_map = {
+        "safe": "✅ SAFE",
+        "caution": "⚠️ CAUTION",
+        "danger": "⛔ DANGER"
+    }
+    pet_map = {
+        "safe": "🙂 Great job checking first!",
+        "caution": "😟 Be careful — verify sender details.",
+        "danger": "😣 Don’t click this link!"
+    }
+    banner = banner_map[risk]
+    pet = pet_map[risk]
+
     return jsonify({
         "risk": risk,
         "rationale": rationale,
         "tips": tips,
+        "banner": banner,
+        "pet": pet,
         "evidence": {
             "url": url,
             "score": score,
@@ -201,5 +215,4 @@ def health():
     return {"ok": True}, 200
 
 if __name__ == "__main__":
-    # Local run; Render uses gunicorn via Procfile
     app.run(host="0.0.0.0", port=8000, debug=True)
