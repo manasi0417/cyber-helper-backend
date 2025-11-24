@@ -13,12 +13,11 @@ from openai import OpenAI   # NEW SDK
 app = Flask(__name__)
 
 # ================================
-# API KEYS (ENV)
+# API KEYS
 # ================================
 GSB_API_KEY = os.getenv("GSB_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-# DEBUG: print whether GSB key is loaded
 print("DEBUG — GSB KEY LOADED:", bool(GSB_API_KEY))
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -26,7 +25,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 GSB_URL = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 
 # ================================
-# Heuristic Settings
+# Heuristic settings
 # ================================
 SUSPICIOUS_TLDS = {"zip", "xyz", "ru", "tk", "top", "work", "click", "fit", "cf", "gq", "ml"}
 SAFE_TLDS = {"com", "org", "net", "co", "uk", "edu", "gov"}
@@ -41,11 +40,17 @@ URL_RE = re.compile(
 # URL Normalisation
 # ================================
 def normalize_url(raw: str) -> str:
-    raw = (raw or "").strip()
+    if not raw:
+        return ""
+
+    raw = raw.strip()
+
     if not re.match(r"^https?://", raw, re.I):
         raw = "http://" + raw
+
     p = urlparse(raw)
     host = p.hostname or ""
+
     try:
         host_ascii = idna.encode(host).decode("ascii")
     except Exception:
@@ -57,11 +62,12 @@ def normalize_url(raw: str) -> str:
 
     url = f"{p.scheme.lower()}://{host_ascii}{port}{path}"
     if query:
-        url += "?" + query
+        url += f"?{query}"
+
     return url
 
 # ================================
-# Extract URL from message
+# Extract URL from text
 # ================================
 def extract_first_url(text: str):
     if not text:
@@ -70,49 +76,49 @@ def extract_first_url(text: str):
     t = unescape(text).replace("\u200b", "").replace("\u2060", "").strip()
 
     m = re.search(r'href=["\']([^"\']+)["\']', t, flags=re.I)
-    if m: return m.group(1).strip()
+    if m:
+        return m.group(1).strip()
 
     m = re.search(r'\]\((https?://[^\s)]+)\)', t, flags=re.I)
-    if m: return m.group(1).strip()
+    if m:
+        return m.group(1).strip()
 
     m = re.search(r'<(https?://[^>\s]+)>', t, flags=re.I)
-    if m: return m.group(1).strip()
+    if m:
+        return m.group(1).strip()
 
     m = URL_RE.search(t)
     return m.group(0).strip() if m else None
 
 # ================================
-# Heuristic Scoring
+# Heuristic scoring
 # ================================
 def heuristic_score(url: str):
-    score, signals = 0.0, []
+    score = 0.0
+    signals = []
 
     p = urlparse(url)
     host = (p.hostname or "").lower()
+
     ext = tldextract.extract(host)
     domain = ".".join([x for x in [ext.domain, ext.suffix] if x])
 
-    # HTTPS check
     if p.scheme != "https":
         score += 2
         signals.append("no_https")
 
-    # IP address domain
     if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
         score += 3
-        signals.append("ip_host")
+        signals.append("ip_address_domain")
 
-    # Long URL
     if len(url) > 120:
         score += 1
         signals.append("long_url")
 
-    # Too many subdomains
     if ext.subdomain and len(ext.subdomain.split(".")) >= 3:
         score += 1
         signals.append("many_subdomains")
 
-    # Suspicious TLD
     tld = (ext.suffix or "").lower()
     if tld in SUSPICIOUS_TLDS:
         score += 2
@@ -122,28 +128,25 @@ def heuristic_score(url: str):
         score += 0.5
         signals.append("uncommon_tld")
 
-    # Lookalike domains
-    if any(ch in host for ch in ["0", "1", "5"]) and any(ch in host for ch in ["o", "l", "i", "s"]):
+    if any(c in host for c in "015") and any(c in host for c in "olis"):
         score += 1
-        signals.append("lookalike_hint")
+        signals.append("lookalike_domain")
 
-    # Brand mismatch in path
     path = (p.path or "").lower()
-    for brand in ["bank", "paypal", "amazon", "microsoft", "royalmail", "dhl", "hmrc", "gov"]:
+    for brand in ["paypal", "amazon", "microsoft", "bank", "hsbc", "dhl", "royalmail", "hmrc", "gov"]:
         if f"/{brand}" in path and brand not in domain:
             score += 1.5
             signals.append("brand_mismatch")
             break
 
-    # URL shorteners
     if host in SHORTENERS:
         score += 0.5
-        signals.append("shortener")
+        signals.append("url_shortener")
 
     return score, signals, domain
 
 # ================================
-# Google Safe Browsing API
+# Google Safe Browsing Lookup (FIXED)
 # ================================
 def gsb_lookup(url: str):
     if not GSB_API_KEY:
@@ -164,25 +167,37 @@ def gsb_lookup(url: str):
         }
     }
 
+    headers = {"Content-Type": "application/json"}
+
     try:
-        r = requests.post(f"{GSB_URL}?key={GSB_API_KEY}", json=payload, timeout=5)
+        r = requests.post(
+            f"{GSB_URL}?key={GSB_API_KEY}",
+            json=payload,
+            headers=headers,
+            timeout=5
+        )
         data = r.json()
-        return "malicious" if data.get("matches") else "clean"
+        print("GSB RAW RESPONSE:", data)   # DEBUG
+
+        if data.get("matches"):
+            return "malicious"
+        return "clean"
+
     except Exception as e:
-        print("GSB lookup error:", e)
+        print("GSB ERROR:", e)
         return "error"
 
 # ================================
-# Decide Final Risk
+# Decide risk
 # ================================
 def decide(score, rep):
     if rep == "malicious":
         return "danger", "Reported as malicious by Google Safe Browsing."
 
     if score >= 3:
-        return "caution", "Unusual patterns found — check carefully."
+        return "caution", "Unusual patterns found — please check carefully."
 
-    return "safe", "No obvious risks found in initial checks."
+    return "safe", "No obvious risks in the quick checks."
 
 # ================================
 # URL CHECK ENDPOINT
@@ -190,9 +205,10 @@ def decide(score, rep):
 @app.post("/check_url")
 def check_url():
     body = request.get_json(silent=True) or {}
-    text = (body.get("text") or body.get("url") or "").strip()
 
+    text = (body.get("text") or body.get("url") or "").strip()
     url_raw = extract_first_url(text)
+
     if not url_raw:
         return jsonify({
             "risk": "caution",
@@ -204,6 +220,7 @@ def check_url():
         })
 
     t0 = time.time()
+
     url = normalize_url(url_raw)
 
     score, signals, domain = heuristic_score(url)
@@ -217,11 +234,11 @@ def check_url():
             "Never enter passwords unless sure."
         ],
         "caution": [
-            "Be careful — verify sender details.",
-            "Check the domain spelling closely."
+            "Be careful — verify the sender.",
+            "Check spelling closely."
         ],
         "danger": [
-            "Do not open this link.",
+            "Do NOT open this link.",
             "Delete the message and block the sender."
         ]
     }[risk]
@@ -233,7 +250,7 @@ def check_url():
     }[risk]
 
     pet = {
-        "safe": "🙂 Cyber Hint: Looks safe.",
+        "safe": "🙂 Cyber Hint: Looks okay.",
         "caution": "😟 Cyber Hint: Be careful.",
         "danger": "😣 Cyber Hint: Don’t click this link!"
     }[risk]
@@ -265,19 +282,14 @@ def ai_answer():
         if not user_message:
             return jsonify({"reply": "Please type your question again."})
 
-        if not OPENAI_API_KEY:
-            return jsonify({"reply": "AI replies not configured."})
-
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Cyber Helper, a friendly AI for senior citizens. "
-                        "Use very simple language and step-by-step instructions."
-                    )
-                },
+                {"role": "system",
+                 "content":
+                    "You are Cyber Helper, a friendly AI designed for senior citizens. "
+                    "Use very simple language and step-by-step instructions."
+                 },
                 {"role": "user", "content": user_message}
             ],
             max_tokens=350,
@@ -290,7 +302,7 @@ def ai_answer():
         return jsonify({"error": str(e)}), 500
 
 # ================================
-# Health Check
+# Health Endpoint
 # ================================
 @app.get("/health")
 def health():
