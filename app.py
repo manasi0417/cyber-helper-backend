@@ -3,11 +3,15 @@ from flask import Flask, request, jsonify
 from urllib.parse import urlparse
 from html import unescape
 import tldextract, idna
+import openai   # NEW
 
 app = Flask(__name__)
 
-# === Reputation service (env var) ===
+# === API KEYS ===
 GSB_API_KEY = os.getenv("GSB_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()  # NEW
+openai.api_key = OPENAI_API_KEY  # NEW
+
 GSB_URL = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 
 # === Heuristic config ===
@@ -15,7 +19,7 @@ SUSPICIOUS_TLDS = {"zip","xyz","ru","tk","top","work","click","fit","cf","gq","m
 SAFE_TLDS       = {"com","org","net","co","uk","edu","gov"}
 SHORTENERS      = {"bit.ly","t.co","tinyurl.com","goo.gl","ow.ly","is.gd"}
 
-# Tolerant URL regex (avoids < > " ), captures domains-with-paths too
+# Tolerant URL regex
 URL_RE = re.compile(
     r'(https?://[^\s<>"\)]+|[a-z0-9.-]+\.[a-z]{2,}(/[^\s<>"\)]*)?)',
     re.I
@@ -44,27 +48,19 @@ def normalize_url(raw: str) -> str:
     return norm
 
 def extract_first_url(text: str):
-    """Extract URL from HTML/Markdown/plain text."""
     if not text:
         return None
     t = unescape(text).replace("\u200b","").replace("\u2060","").strip()
 
-    # 1) HTML <a href="...">
     m = re.search(r'href=["\']([^"\']+)["\']', t, flags=re.I)
-    if m:
-        return m.group(1).strip()
+    if m: return m.group(1).strip()
 
-    # 2) Markdown [label](https://url)
     m = re.search(r'\]\((https?://[^\s)]+)\)', t, flags=re.I)
-    if m:
-        return m.group(1).strip()
+    if m: return m.group(1).strip()
 
-    # 3) Angle style <https://url>
     m = re.search(r'<(https?://[^>\s]+)>', t, flags=re.I)
-    if m:
-        return m.group(1).strip()
+    if m: return m.group(1).strip()
 
-    # 4) Fallback plain text/domain
     m = URL_RE.search(t)
     return m.group(0).strip() if m else None
 
@@ -103,12 +99,7 @@ def heuristic_score(url: str):
 
     return score, signals, domain
 
-# ---------------------------
-# Reputation lookup
-# ---------------------------
-
 def gsb_lookup(url: str):
-    """Google Safe Browsing v4. Returns 'malicious', 'clean', 'error', or None if not configured."""
     if not GSB_API_KEY:
         return None
     payload = {
@@ -137,11 +128,11 @@ def decide(score, rep):
     if rep == "malicious":
         return "danger", "Reported as malicious by a reputation service."
     if score >= 3:
-        return "caution", "Unusual patterns (HTTPS/TLD/subdomain). Check carefully."
-    return "safe", "No obvious risks found in quick checks."
+        return "caution", "Unusual patterns found. Check carefully."
+    return "safe", "No obvious risks found in initial checks."
 
 # ---------------------------
-# Routes
+# URL CHECK ROUTE
 # ---------------------------
 
 @app.post("/check_url")
@@ -163,35 +154,18 @@ def check_url():
     url = normalize_url(url_raw)
     score, signals, domain = heuristic_score(url)
 
-    rep = gsb_lookup(url)  # may be None if no key
+    rep = gsb_lookup(url)
     risk, rationale = decide(score, rep)
 
     tips = {
-        "safe": [
-            "Open only if you expected it.",
-            "Avoid entering passwords unless you trust the site."
-        ],
-        "caution": [
-            "Don’t click directly; verify via the official app.",
-            "Check sender and domain spelling carefully."
-        ],
-        "danger": [
-            "Do not open this link.",
-            "Delete the message and block the sender."
-        ]
+        "safe": ["Open only if you expected it.","Avoid entering passwords unless you trust the site."],
+        "caution": ["Don’t click directly; verify via official apps.","Check sender and domain spelling."],
+        "danger": ["Do not open this link.","Delete the message and block the sender."]
     }[risk]
 
-    # Decorated fields for Tiledesk (no conditionals in template)
-    banner_map = {
-        "safe": "✅ SAFE",
-        "caution": "⚠️ CAUTION",
-        "danger": "⛔ DANGER"
-    }
-    pet_map = {
-        "safe": "🙂 Great job checking first!",
-        "caution": "😟 Be careful — verify sender details.",
-        "danger": "😣 Don’t click this link!"
-    }
+    banner_map = {"safe":"✅ SAFE","caution":"⚠️ CAUTION","danger":"⛔ DANGER"}
+    pet_map = {"safe":"🙂 Great job checking first!","caution":"😟 Be careful.","danger":"😣 Don’t click this link!"}
+
     banner = banner_map[risk]
     pet = pet_map[risk]
 
@@ -209,6 +183,49 @@ def check_url():
         },
         "elapsed_ms": int((time.time() - t0) * 1000)
     }), 200
+
+# ---------------------------
+# NEW: SMART AI CYBER HINT ROUTE
+# ---------------------------
+
+@app.post("/ai_answer")
+def ai_answer():
+    try:
+        data = request.get_json() or {}
+        user_message = data.get("message", "").strip()
+
+        if not user_message:
+            return jsonify({"reply": "Please type your question again."}), 200
+
+        if not OPENAI_API_KEY:
+            return jsonify({"reply": "AI replies are not configured yet."}), 200
+
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Cyber Helper, a friendly AI designed to help senior "
+                        "citizens stay safe online. Use simple words. Give step-by-step "
+                        "instructions. Avoid technical jargon."
+                    )
+                },
+                {"role": "user", "content": user_message}
+            ],
+            max_tokens=350,
+            temperature=0.4
+        )
+
+        ai_reply = response["choices"][0]["message"]["content"].strip()
+        return jsonify({"reply": ai_reply})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------------------------
+# Health Check
+# ---------------------------
 
 @app.get("/health")
 def health():
