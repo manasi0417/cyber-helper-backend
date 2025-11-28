@@ -28,13 +28,19 @@ GSB_URL = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 # ================================
 # Heuristic settings
 # ================================
-SUSPICIOUS_TLDS = {"zip","xyz","ru","tk","top","work","click","fit","cf","gq","ml"}
-SAFE_TLDS = {"com","org","net","co","uk","edu","gov"}
-SHORTENERS = {"bit.ly","t.co","tinyurl.com","goo.gl","ow.ly","is.gd"}
+SUSPICIOUS_TLDS = {
+    "zip", "xyz", "ru", "tk", "top", "work", "click", "fit", "cf", "gq", "ml"
+}
+SAFE_TLDS = {"com", "org", "net", "co", "uk", "edu", "gov"}
+SHORTENERS = {"bit.ly", "t.co", "tinyurl.com", "goo.gl", "ow.ly", "is.gd"}
 
 HIGH_TRUST_DOMAINS = {
-    "wikipedia.org","en.wikipedia.org","nhs.uk","gov.uk",
-    "service.gov.uk","europa.eu"
+    "wikipedia.org",
+    "en.wikipedia.org",
+    "nhs.uk",
+    "gov.uk",
+    "service.gov.uk",
+    "europa.eu",
 }
 
 URL_RE = re.compile(
@@ -51,17 +57,20 @@ def normalize_url(raw: str) -> str:
 
     raw = raw.strip()
 
+    # add scheme if missing
     if not re.match(r"^https?://", raw, re.I):
         raw = "http://" + raw
 
     p = urlparse(raw)
     host = p.hostname or ""
 
+    # punycode normalisation
     try:
         host_ascii = idna.encode(host).decode("ascii")
     except Exception:
         host_ascii = host
 
+    # strip tracking params
     query = re.sub(
         r"(utm_[^=&]+|fbclid|gclid)=[^&]+&?",
         "",
@@ -79,7 +88,7 @@ def normalize_url(raw: str) -> str:
     return url
 
 # ================================
-# Extract URL (from manual text OR OCR)
+# Extract URL from text / OCR
 # ================================
 def extract_first_url(text: str):
     if not text:
@@ -92,22 +101,18 @@ def extract_first_url(text: str):
         .strip()
     )
 
-    # HTML href
     m = re.search(r'href=["\']([^"\']+)["\']', t, flags=re.I)
     if m:
         return m.group(1).strip()
 
-    # Markdown
     m = re.search(r"\]\((https?://[^\s)]+)\)", t, flags=re.I)
     if m:
         return m.group(1).strip()
 
-    # <https://...>
     m = re.search(r"<(https?://[^>\s]+)>", t, flags=re.I)
     if m:
         return m.group(1).strip()
 
-    # Plain URL
     m = URL_RE.search(t)
     return m.group(0).strip() if m else None
 
@@ -120,11 +125,12 @@ def heuristic_score(url: str):
 
     p = urlparse(url)
     host = (p.hostname or "").lower()
+
     ext = tldextract.extract(host)
-
     domain = ".".join([x for x in [ext.domain, ext.suffix] if x])
-    full_host = ".".join(part for part in [ext.subdomain, ext.domain, ext.suffix] if part)
 
+    # highly trusted domains → subtract a bit of risk
+    full_host = ".".join(part for part in [ext.subdomain, ext.domain, ext.suffix] if part)
     if full_host in HIGH_TRUST_DOMAINS or domain in HIGH_TRUST_DOMAINS:
         score -= 1.5
         signals.append("high_trust_domain")
@@ -149,7 +155,7 @@ def heuristic_score(url: str):
     if tld in SUSPICIOUS_TLDS:
         score += 2
         signals.append("suspicious_tld")
-    elif tld not in SAFE_TLDS:
+    elif tld and tld not in SAFE_TLDS:
         score += 0.5
         signals.append("uncommon_tld")
 
@@ -158,7 +164,7 @@ def heuristic_score(url: str):
         signals.append("lookalike_domain")
 
     path = (p.path or "").lower()
-    for brand in ["paypal","amazon","microsoft","bank","hsbc","dhl","royalmail","hmrc","gov"]:
+    for brand in ["paypal", "amazon", "microsoft", "bank", "hsbc", "dhl", "royalmail", "hmrc", "gov"]:
         if f"/{brand}" in path and brand not in domain:
             score += 1.5
             signals.append("brand_mismatch")
@@ -181,8 +187,10 @@ def gsb_lookup(url: str):
         "client": {"clientId": "cyber-helper", "clientVersion": "1.0"},
         "threatInfo": {
             "threatTypes": [
-                "MALWARE","SOCIAL_ENGINEERING","UNWANTED_SOFTWARE",
-                "POTENTIALLY_HARMFUL_APPLICATION"
+                "MALWARE",
+                "SOCIAL_ENGINEERING",
+                "UNWANTED_SOFTWARE",
+                "POTENTIALLY_HARMFUL_APPLICATION",
             ],
             "platformTypes": ["ANY_PLATFORM"],
             "threatEntryTypes": ["URL"],
@@ -190,25 +198,95 @@ def gsb_lookup(url: str):
         },
     }
 
+    headers = {"Content-Type": "application/json"}
+
     try:
         r = requests.post(
             f"{GSB_URL}?key={GSB_API_KEY}",
             json=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             timeout=5,
         )
         r.raise_for_status()
         data = r.json()
+        print("GSB RAW RESPONSE:", data)
 
         if data.get("matches"):
             return "malicious"
         return "clean"
 
-    except Exception:
+    except Exception as e:
+        print("GSB ERROR:", e)
         return "error"
 
+
 # ================================
-# AI URL review
+# AI OCR URL EXTRACTOR ENDPOINT (NEW)
+# ================================
+@app.post("/ai_extract_url")
+def ai_extract_url():
+    """
+    Input:
+      { "text": "<ocr_text_here>" }
+
+    Output:
+      { "url": "...", "reason": "..." }
+    """
+
+    try:
+        data = request.get_json(silent=True) or {}
+        raw_text = (data.get("text") or "").strip()
+
+        if not raw_text:
+            return jsonify({"url": None, "reason": "No text provided."})
+
+        if not client:
+            return jsonify({"url": None, "reason": "AI service unavailable."})
+
+        prompt = (
+            "You are a cybersecurity assistant. Extract the REAL website link "
+            "from this screenshot text. Scammers often split links, add spaces, "
+            "write 'dot' instead of '.', or break URLs across lines.\n\n"
+            "Rules:\n"
+            "• Return ONLY JSON.\n"
+            "• If you find a URL, fix it.\n"
+            "• If no URL exists, return url=null.\n\n"
+            f"Text:\n{raw_text}\n\n"
+            "Format:\n"
+            "{\"url\": \"https://example.com\", \"reason\": \"Explanation\"}"
+        )
+
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Return JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=200,
+        )
+
+        raw = completion.choices[0].message.content.strip()
+
+        m = re.search(r"\{.*\}", raw, flags=re.S)
+        if not m:
+            return jsonify({"url": None, "reason": "AI returned no JSON."})
+
+        import json
+        parsed = json.loads(m.group(0))
+
+        return jsonify({
+            "url": parsed.get("url"),
+            "reason": parsed.get("reason")
+        })
+
+    except Exception as e:
+        print("AI_EXTRACT_URL ERROR:", e)
+        return jsonify({"url": None, "reason": "Error processing text."})
+
+
+# ================================
+# Advanced AI URL assessment
 # ================================
 def ai_url_review(url: str, surrounding_text: str | None = None):
     if not client:
@@ -216,26 +294,23 @@ def ai_url_review(url: str, surrounding_text: str | None = None):
 
     try:
         prompt = (
-            "You are Cyber Helper, a cautious online safety assistant.\n"
-            "Analyse the URL and classify the risk as SAFE, CAUTION, or DANGER.\n"
-            "Focus on phishing and scams.\n\n"
-            f"URL: {url}\n"
-            f"Surrounding text:\n{surrounding_text or '(none)'}\n\n"
-            "Return ONLY JSON in this format:\n"
-            '{"risk": "SAFE|CAUTION|DANGER", "reason": "..."}'
+            "You are Cyber Helper, a cautious security assistant for senior citizens.\n"
+            "Classify this link as SAFE, CAUTION, or DANGER.\n\n"
+            f"URL: {url}\n\nText around it:\n{surrounding_text}\n\n"
+            "Return JSON: {\"risk\":\"SAFE|CAUTION|DANGER\",\"reason\":\"...\"}"
         )
 
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Reply only in JSON."},
+                {"role": "system", "content": "Return JSON only."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.1,
             max_tokens=150,
+            temperature=0.1,
         )
 
-        raw = completion.choices[0].message.content.strip()
+        raw = completion.choices[0].message.content or ""
 
         m = re.search(r"\{.*\}", raw, flags=re.S)
         if not m:
@@ -243,27 +318,28 @@ def ai_url_review(url: str, surrounding_text: str | None = None):
 
         import json
         data = json.loads(m.group(0))
+        risk_str = data.get("risk", "").upper()
+        reason = data.get("reason", "")
 
-        risk_map = {"SAFE": "safe", "CAUTION": "caution", "DANGER": "danger"}
-        risk = risk_map.get(data.get("risk", "").upper())
+        mapping = {"SAFE": "safe", "CAUTION": "caution", "DANGER": "danger"}
+        return mapping.get(risk_str), reason
 
-        return risk, data.get("reason")
-
-    except Exception:
+    except Exception as e:
+        print("AI URL REVIEW ERROR:", e)
         return None, None
 
 # ================================
-# FINAL DECISION
+# Decide final risk
 # ================================
 def decide(score, rep, ai_risk=None, ai_reason=None):
     if rep == "malicious":
-        return "danger", "Reported as malicious by Google Safe Browsing."
+        return "danger", "Reported malicious by Google Safe Browsing."
 
     if ai_risk in {"danger", "caution"}:
-        return ai_risk, ai_reason or "Extra checks found issues."
+        return ai_risk, ai_reason or "AI suggests caution."
 
     if score >= 3:
-        return "caution", "Unusual patterns found — please be careful."
+        return "caution", "Unusual pattern detected."
 
     return "safe", "No obvious risks found."
 
@@ -271,7 +347,7 @@ def decide(score, rep, ai_risk=None, ai_reason=None):
 # URL CHECK ENDPOINT
 # ================================
 @app.post("/check_url")
-def check_url_route():
+def check_url():
     body = request.get_json(silent=True) or {}
 
     text = (body.get("text") or body.get("url") or "").strip()
@@ -280,52 +356,67 @@ def check_url_route():
     if not url_raw:
         return jsonify({
             "risk": "caution",
-            "rationale": "I couldn’t find a link in your message.",
+            "rationale": "No link detected.",
             "tips": [
-                "Try to read the link aloud or type what you see.",
-                "Or share a clearer screenshot."
-            ]
+                "If it's a screenshot, type the website manually.",
+                "Ask someone you trust if unsure.",
+            ],
         })
 
     t0 = time.time()
-    url = normalize_url(url_raw)
 
+    url = normalize_url(url_raw)
     score, signals, domain = heuristic_score(url)
     rep = gsb_lookup(url)
+
     ai_risk, ai_reason = (None, None)
-
     if rep != "malicious":
-        ai_risk, ai_reason = ai_url_review(url, text)
+        ai_risk, ai_reason = ai_url_review(url, surrounding_text=text)
 
-    risk, rationale = decide(score, rep, ai_risk, ai_reason)
+    risk, rationale = decide(score, rep, ai_risk=ai_risk, ai_reason=ai_reason)
 
-    tips = {
+    tips_map = {
         "safe": [
-            "Open only if you expected this message.",
-            "Never enter passwords unless sure the site is real."
+            "Open only if expected.",
+            "Never type passwords unless sure the website is real.",
         ],
         "caution": [
-            "Check spelling carefully.",
-            "If unsure, avoid entering personal details."
+            "Check the sender carefully.",
+            "Avoid giving personal details.",
         ],
         "danger": [
             "Do NOT open this link.",
-            "Delete the message and block the sender."
-        ]
+            "Delete the message and block the sender.",
+        ],
+    }
+
+    banner_map = {
+        "safe": "✅ SAFE",
+        "caution": "⚠️ CAUTION",
+        "danger": "⛔ DANGER",
+    }
+
+    pet_map = {
+        "safe": "🙂 Cyber Hint: Looks okay.",
+        "caution": "😟 Cyber Hint: Be careful.",
+        "danger": "😣 Cyber Hint: Don’t click this!",
     }
 
     return jsonify({
         "risk": risk,
         "rationale": rationale,
-        "tips": tips[risk],
+        "tips": tips_map[risk],
+        "banner": banner_map[risk],
+        "pet": pet_map[risk],
         "evidence": {
             "url": url,
+            "original_text": text,
             "score": score,
             "signals": signals,
             "rep": rep,
-            "ai_risk": ai_risk
+            "ai_risk": ai_risk,
         },
-        "elapsed_ms": int((time.time() - t0) * 1000)
+        "elapsed_ms": int((time.time() - t0) * 1000),
     })
 
 # ================================
@@ -335,46 +426,43 @@ def check_url_route():
 def ai_answer():
     try:
         data = request.get_json(silent=True) or {}
-        msg = (data.get("message") or "").strip()
+        user_message = (data.get("message") or "").strip()
 
-        if not msg:
-            return jsonify({"reply": "Please type something."})
+        if not user_message:
+            return jsonify({"reply": "Please type your question again."})
 
         if not client:
-            return jsonify({"reply": "I cannot reach the helper service."})
+            return jsonify({"reply": "AI service unavailable."})
 
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system",
-                 "content": (
-                     "You are Cyber Helper. Speak simply. Use short steps. "
-                     "Help seniors stay safe online."
-                 )},
-                {"role": "user", "content": msg},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Cyber Helper, a friendly AI for senior citizens. "
+                        "Use simple language and step-by-step advice."
+                    ),
+                },
+                {"role": "user", "content": user_message},
             ],
-            max_tokens=300,
-            temperature=0.4
+            max_tokens=350,
+            temperature=0.4,
         )
 
-        reply = completion.choices[0].message.content
-        return jsonify({"reply": reply})
+        return jsonify({"reply": completion.choices[0].message.content})
 
-    except Exception:
-        return jsonify({
-            "reply": "Something went wrong. Please try again later."
-        })
+    except Exception as e:
+        print("AI_ANSWER ERROR:", e)
+        return jsonify({"reply": "Something went wrong. Try again later."})
 
 # ================================
-# HEALTH
+# Health Endpoint
 # ================================
 @app.get("/health")
 def health():
     return {"ok": True}, 200
 
 
-# ================================
-# RUN
-# ================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
