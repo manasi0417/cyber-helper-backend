@@ -221,57 +221,55 @@ def gsb_lookup(url: str):
 
 
 # ================================
-# AI OCR URL EXTRACTOR ENDPOINT (NEW)
+# AI URL EXTRACTION ENDPOINT
 # ================================
 @app.post("/ai_extract_url")
 def ai_extract_url():
-    """
-    Input:
-      { "text": "<ocr_text_here>" }
-
-    Output:
-      { "url": "...", "reason": "..." }
-    """
-
     try:
         data = request.get_json(silent=True) or {}
-        raw_text = (data.get("text") or "").strip()
+        text = (data.get("text") or "").strip()
 
-        if not raw_text:
-            return jsonify({"url": None, "reason": "No text provided."})
+        if not text:
+            return jsonify({"url": None, "reason": "No text provided"})
 
         if not client:
-            return jsonify({"url": None, "reason": "AI service unavailable."})
+            return jsonify({"url": None, "reason": "AI service unavailable"})
 
         prompt = (
-            "You are a cybersecurity assistant. Extract the REAL website link "
-            "from this screenshot text. Scammers often split links, add spaces, "
-            "write 'dot' instead of '.', or break URLs across lines.\n\n"
-            "Rules:\n"
-            "• Return ONLY JSON.\n"
-            "• If you find a URL, fix it.\n"
-            "• If no URL exists, return url=null.\n\n"
-            f"Text:\n{raw_text}\n\n"
-            "Format:\n"
-            "{\"url\": \"https://example.com\", \"reason\": \"Explanation\"}"
+            "Extract a URL from this text. "
+            "Many scammers split URLs like 'h t t p' or 'w w w .'. "
+            "Fix spacing and obfuscation. "
+            "Respond ONLY in JSON: {\"url\":\"\", \"reason\":\"\"}.\n\n"
+            f"TEXT:\n{text}"
         )
 
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Return JSON only."},
+                {"role": "system", "content": "Reply strictly in JSON."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.2,
-            max_tokens=200,
+            max_tokens=120,
+            temperature=0.1,
         )
 
-        raw = completion.choices[0].message.content.strip()
-
+        import json
+        raw = completion.choices[0].message.content
         m = re.search(r"\{.*\}", raw, flags=re.S)
-        if not m:
-            return jsonify({"url": None, "reason": "AI returned no JSON."})
 
+        if not m:
+            return jsonify({"url": None, "reason": "AI returned no JSON"})
+
+        data = json.loads(m.group(0))
+
+        return jsonify({
+            "url": data.get("url"),
+            "reason": data.get("reason", "")
+        })
+
+    except Exception as e:
+        print("AI URL EXTRACT ERROR:", e)
+        return jsonify({"url": None, "reason": "Server error"})
         import json
         parsed = json.loads(m.group(0))
 
