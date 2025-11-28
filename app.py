@@ -28,19 +28,13 @@ GSB_URL = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 # ================================
 # Heuristic settings
 # ================================
-SUSPICIOUS_TLDS = {
-    "zip", "xyz", "ru", "tk", "top", "work", "click", "fit", "cf", "gq", "ml"
-}
-SAFE_TLDS = {"com", "org", "net", "co", "uk", "edu", "gov"}
-SHORTENERS = {"bit.ly", "t.co", "tinyurl.com", "goo.gl", "ow.ly", "is.gd"}
+SUSPICIOUS_TLDS = {"zip","xyz","ru","tk","top","work","click","fit","cf","gq","ml"}
+SAFE_TLDS = {"com","org","net","co","uk","edu","gov"}
+SHORTENERS = {"bit.ly","t.co","tinyurl.com","goo.gl","ow.ly","is.gd"}
 
 HIGH_TRUST_DOMAINS = {
-    "wikipedia.org",
-    "en.wikipedia.org",
-    "nhs.uk",
-    "gov.uk",
-    "service.gov.uk",
-    "europa.eu",
+    "wikipedia.org","en.wikipedia.org","nhs.uk","gov.uk",
+    "service.gov.uk","europa.eu"
 }
 
 URL_RE = re.compile(
@@ -57,20 +51,17 @@ def normalize_url(raw: str) -> str:
 
     raw = raw.strip()
 
-    # add scheme if missing
     if not re.match(r"^https?://", raw, re.I):
         raw = "http://" + raw
 
     p = urlparse(raw)
     host = p.hostname or ""
 
-    # punycode normalisation
     try:
         host_ascii = idna.encode(host).decode("ascii")
     except Exception:
         host_ascii = host
 
-    # strip tracking params
     query = re.sub(
         r"(utm_[^=&]+|fbclid|gclid)=[^&]+&?",
         "",
@@ -88,7 +79,7 @@ def normalize_url(raw: str) -> str:
     return url
 
 # ================================
-# Extract URL (raw + OCR)
+# Extract URL (from manual text OR OCR)
 # ================================
 def extract_first_url(text: str):
     if not text:
@@ -101,15 +92,22 @@ def extract_first_url(text: str):
         .strip()
     )
 
+    # HTML href
     m = re.search(r'href=["\']([^"\']+)["\']', t, flags=re.I)
-    if m: return m.group(1).strip()
+    if m:
+        return m.group(1).strip()
 
+    # Markdown
     m = re.search(r"\]\((https?://[^\s)]+)\)", t, flags=re.I)
-    if m: return m.group(1).strip()
+    if m:
+        return m.group(1).strip()
 
+    # <https://...>
     m = re.search(r"<(https?://[^>\s]+)>", t, flags=re.I)
-    if (m): return m.group(1).strip()
+    if m:
+        return m.group(1).strip()
 
+    # Plain URL
     m = URL_RE.search(t)
     return m.group(0).strip() if m else None
 
@@ -122,50 +120,58 @@ def heuristic_score(url: str):
 
     p = urlparse(url)
     host = (p.hostname or "").lower()
-
     ext = tldextract.extract(host)
-    domain = ".".join([x for x in [ext.domain, ext.suffix] if x])
-    full_host = ".".join([x for x in [ext.subdomain, ext.domain, ext.suffix] if x])
 
-    # highly trusted domains
+    domain = ".".join([x for x in [ext.domain, ext.suffix] if x])
+    full_host = ".".join(part for part in [ext.subdomain, ext.domain, ext.suffix] if part)
+
     if full_host in HIGH_TRUST_DOMAINS or domain in HIGH_TRUST_DOMAINS:
         score -= 1.5
         signals.append("high_trust_domain")
 
     if p.scheme != "https":
-        score += 2; signals.append("no_https")
+        score += 2
+        signals.append("no_https")
 
     if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
-        score += 3; signals.append("ip_address_domain")
+        score += 3
+        signals.append("ip_address_domain")
 
     if len(url) > 120:
-        score += 1; signals.append("long_url")
+        score += 1
+        signals.append("long_url")
 
     if ext.subdomain and len(ext.subdomain.split(".")) >= 3:
-        score += 1; signals.append("many_subdomains")
+        score += 1
+        signals.append("many_subdomains")
 
     tld = (ext.suffix or "").lower()
     if tld in SUSPICIOUS_TLDS:
-        score += 2; signals.append("suspicious_tld")
-    elif tld and tld not in SAFE_TLDS:
-        score += 0.5; signals.append("uncommon_tld")
+        score += 2
+        signals.append("suspicious_tld")
+    elif tld not in SAFE_TLDS:
+        score += 0.5
+        signals.append("uncommon_tld")
 
     if any(c in host for c in "015") and any(c in host for c in "olis"):
-        score += 1; signals.append("lookalike_domain")
+        score += 1
+        signals.append("lookalike_domain")
 
     path = (p.path or "").lower()
     for brand in ["paypal","amazon","microsoft","bank","hsbc","dhl","royalmail","hmrc","gov"]:
         if f"/{brand}" in path and brand not in domain:
-            score += 1.5; signals.append("brand_mismatch")
+            score += 1.5
+            signals.append("brand_mismatch")
             break
 
     if host in SHORTENERS:
-        score += 0.5; signals.append("url_shortener")
+        score += 0.5
+        signals.append("url_shortener")
 
     return score, signals, domain or full_host or host
 
 # ================================
-# Google Safe Browsing
+# Google Safe Browsing Lookup
 # ================================
 def gsb_lookup(url: str):
     if not GSB_API_KEY:
@@ -175,8 +181,8 @@ def gsb_lookup(url: str):
         "client": {"clientId": "cyber-helper", "clientVersion": "1.0"},
         "threatInfo": {
             "threatTypes": [
-                "MALWARE","SOCIAL_ENGINEERING",
-                "UNWANTED_SOFTWARE","POTENTIALLY_HARMFUL_APPLICATION",
+                "MALWARE","SOCIAL_ENGINEERING","UNWANTED_SOFTWARE",
+                "POTENTIALLY_HARMFUL_APPLICATION"
             ],
             "platformTypes": ["ANY_PLATFORM"],
             "threatEntryTypes": ["URL"],
@@ -191,128 +197,99 @@ def gsb_lookup(url: str):
             headers={"Content-Type": "application/json"},
             timeout=5,
         )
+        r.raise_for_status()
         data = r.json()
+
         if data.get("matches"):
             return "malicious"
         return "clean"
-    except Exception as e:
-        print("GSB ERROR:", e)
+
+    except Exception:
         return "error"
 
 # ================================
-# AI review of URLs
+# AI URL review
 # ================================
-def ai_url_review(url: str, surrounding_text: str = None):
+def ai_url_review(url: str, surrounding_text: str | None = None):
     if not client:
         return None, None
 
     try:
         prompt = (
-            "Analyse the URL and classify its risk as SAFE, CAUTION, or DANGER.\n"
-            "Return JSON only: {\"risk\": \"...\",
-             \"reason\": \"...\"}\n"
-            f"URL: {url}\nContext: {surrounding_text}"
+            "You are Cyber Helper, a cautious online safety assistant.\n"
+            "Analyse the URL and classify the risk as SAFE, CAUTION, or DANGER.\n"
+            "Focus on phishing and scams.\n\n"
+            f"URL: {url}\n"
+            f"Surrounding text:\n{surrounding_text or '(none)'}\n\n"
+            "Return ONLY JSON in this format:\n"
+            '{"risk": "SAFE|CAUTION|DANGER", "reason": "..."}'
         )
 
-        out = client.chat.completions.create(
+        completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Return JSON only."},
+                {"role": "system", "content": "Reply only in JSON."},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=150,
             temperature=0.1,
+            max_tokens=150,
         )
 
-        raw = out.choices[0].message.content or ""
+        raw = completion.choices[0].message.content.strip()
+
+        m = re.search(r"\{.*\}", raw, flags=re.S)
+        if not m:
+            return None, None
 
         import json
-        m = re.search(r"\{.*\}", raw, re.S)
-        if not m: return None, None
-
         data = json.loads(m.group(0))
+
         risk_map = {"SAFE": "safe", "CAUTION": "caution", "DANGER": "danger"}
-        risk = risk_map.get(str(data.get("risk","")).upper())
+        risk = risk_map.get(data.get("risk", "").upper())
+
         return risk, data.get("reason")
-    except:
+
+    except Exception:
         return None, None
 
 # ================================
-# NEW: AI extract URL from screenshot OCR text
-# ================================
-@app.post("/ai_extract_url")
-def ai_extract_url():
-    try:
-        data = request.get_json(silent=True) or {}
-        text = (data.get("text") or "").strip()
-
-        if not text:
-            return jsonify({"url": None, "reason": "No text provided."})
-
-        if not client:
-            return jsonify({"url": None, "reason": "AI unavailable."})
-
-        prompt = (
-            "Extract a URL from the text. Fix broken formats like:\n"
-            "hxxp → http, example dot com → example.com, scam[.]site → scam.site.\n"
-            "Return JSON: {\"url\": \"...\", \"reason\": \"...\"}\n\n"
-            f"TEXT:\n{text}"
-        )
-
-        out = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "JSON only."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=200,
-            temperature=0.2,
-        )
-
-        raw = out.choices[0].message.content or ""
-        import json
-        m = re.search(r"\{.*\}", raw, re.S)
-        if not m:
-            return jsonify({"url": None, "reason": "Invalid AI response."})
-
-        return jsonify(json.loads(m.group(0)))
-    except Exception as e:
-        return jsonify({"url": None, "reason": str(e)})
-
-# ================================
-# Decide risk
+# FINAL DECISION
 # ================================
 def decide(score, rep, ai_risk=None, ai_reason=None):
     if rep == "malicious":
-        return "danger", "Reported malicious by Google Safe Browsing."
+        return "danger", "Reported as malicious by Google Safe Browsing."
 
-    if ai_risk in {"danger","caution"}:
-        return ai_risk, ai_reason
+    if ai_risk in {"danger", "caution"}:
+        return ai_risk, ai_reason or "Extra checks found issues."
 
     if score >= 3:
-        return "caution", "Unusual patterns detected."
+        return "caution", "Unusual patterns found — please be careful."
 
-    return "safe", "No strong danger signals detected."
+    return "safe", "No obvious risks found."
 
 # ================================
 # URL CHECK ENDPOINT
 # ================================
 @app.post("/check_url")
-def check_url():
+def check_url_route():
     body = request.get_json(silent=True) or {}
-    text = (body.get("text") or "").strip()
 
+    text = (body.get("text") or body.get("url") or "").strip()
     url_raw = extract_first_url(text)
+
     if not url_raw:
         return jsonify({
             "risk": "caution",
-            "rationale": "I couldn’t find a link in the message.",
-            "tips": ["Try typing it manually.", "Ask someone you trust."],
+            "rationale": "I couldn’t find a link in your message.",
+            "tips": [
+                "Try to read the link aloud or type what you see.",
+                "Or share a clearer screenshot."
+            ]
         })
 
     t0 = time.time()
-
     url = normalize_url(url_raw)
+
     score, signals, domain = heuristic_score(url)
     rep = gsb_lookup(url)
     ai_risk, ai_reason = (None, None)
@@ -322,40 +299,33 @@ def check_url():
 
     risk, rationale = decide(score, rep, ai_risk, ai_reason)
 
-    tips_map = {
+    tips = {
         "safe": [
-            "Open only if you expected it.",
-            "Never enter passwords unless sure."
+            "Open only if you expected this message.",
+            "Never enter passwords unless sure the site is real."
         ],
         "caution": [
-            "Double-check sender.",
-            "Don’t log in if unsure."
+            "Check spelling carefully.",
+            "If unsure, avoid entering personal details."
         ],
         "danger": [
-            "DO NOT open this link.",
-            "Delete the message immediately."
+            "Do NOT open this link.",
+            "Delete the message and block the sender."
         ]
     }
-
-    banner = {
-        "safe": "✅ SAFE",
-        "caution": "⚠️ CAUTION",
-        "danger": "⛔ DANGER",
-    }[risk]
 
     return jsonify({
         "risk": risk,
         "rationale": rationale,
-        "tips": tips_map[risk],
-        "banner": banner,
+        "tips": tips[risk],
         "evidence": {
             "url": url,
             "score": score,
             "signals": signals,
             "rep": rep,
-            "ai_risk": ai_risk,
+            "ai_risk": ai_risk
         },
-        "elapsed_ms": int((time.time() - t0) * 1000),
+        "elapsed_ms": int((time.time() - t0) * 1000)
     })
 
 # ================================
@@ -368,36 +338,43 @@ def ai_answer():
         msg = (data.get("message") or "").strip()
 
         if not msg:
-            return jsonify({"reply": "Please type your question again."})
+            return jsonify({"reply": "Please type something."})
 
         if not client:
-            return jsonify({"reply": "AI unavailable at the moment."})
+            return jsonify({"reply": "I cannot reach the helper service."})
 
-        out = client.chat.completions.create(
+        completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system",
                  "content": (
-                     "You are Cyber Helper for senior citizens. "
-                     "Use simple language and short steps."
+                     "You are Cyber Helper. Speak simply. Use short steps. "
+                     "Help seniors stay safe online."
                  )},
                 {"role": "user", "content": msg},
             ],
-            max_tokens=350,
-            temperature=0.4,
+            max_tokens=300,
+            temperature=0.4
         )
 
-        return jsonify({"reply": out.choices[0].message.content})
+        reply = completion.choices[0].message.content
+        return jsonify({"reply": reply})
 
-    except:
-        return jsonify({"reply": "Something went wrong. Try again later."})
+    except Exception:
+        return jsonify({
+            "reply": "Something went wrong. Please try again later."
+        })
 
 # ================================
-# HEALTH CHECK
+# HEALTH
 # ================================
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True}, 200
 
+
+# ================================
+# RUN
+# ================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
